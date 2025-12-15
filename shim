@@ -1,1 +1,215 @@
+#!/bin/bash
+set -euo pipefail
+
+# ChromeOS factory shim bootstrapper for USB recovery sticks.
+# It downloads a recovery image, optionally injects a factory payload into the stateful
+# partition, and writes a bootable recovery USB so you can boot directly into recovery
+# mode (no virtualization on the host).
+
+DATA_ROOT=${CHROMEOS_SHIM_HOME:-"${HOME}/.local/share/chromeos-factory-shim"}
+BOARD=${CHROMEOS_SHIM_BOARD:-"eve"}
+IMAGE_URL_DEFAULT="https://dl.google.com/dl/edgedl/chromeos/recovery/chromeos_${BOARD}_recovery_stable-channel_latest.bin.zip"
+IMAGE_URL=${CHROMEOS_SHIM_IMAGE_URL:-"${IMAGE_URL_DEFAULT}"}
+PAYLOAD_DIR=""
+TARGET_DEVICE=""
+
+RECOVERY_ZIP="${DATA_ROOT}/recovery.zip"
+IMAGE_BIN="${DATA_ROOT}/chromeos_image.bin"
+
+usage() {
+  cat <<USAGE
+Usage: $0 <init|inject|write|clean> [--board <board>] [--image-url <url>] [--data-root <path>] [--payload-dir <path>] [--device /dev/sdX]
+
+Commands:
+  init            Download the recovery image (no flashing yet).
+  inject          Copy a factory payload directory into the image's stateful partition.
+  write           Write the recovery image to a USB block device.
+  clean           Remove downloaded artifacts.
+
+Options:
+  --board <board>         Override the target board (default: ${BOARD}).
+  --image-url <url>       Use a custom recovery image URL.
+  --data-root <path>      Store and read artifacts from this directory (default: ${DATA_ROOT}).
+  --payload-dir <path>    Path to a directory of factory files to place in the stateful partition.
+  --device /dev/sdX       Block device for writing the bootable stick (required for write).
+USAGE
+}
+
+require_tools() {
+  local missing=()
+  for tool in curl unzip dd losetup mount umount rsync; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      missing+=("$tool")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "Missing required tools: ${missing[*]}" >&2
+    exit 1
+  fi
+}
+
+ensure_data_root() {
+  mkdir -p "$DATA_ROOT"
+}
+
+fetch_image() {
+  if [ -f "$RECOVERY_ZIP" ]; then
+    echo "Recovery archive already present at $RECOVERY_ZIP"
+    return
+  fi
+  echo "Downloading recovery image from $IMAGE_URL"
+  curl -L "$IMAGE_URL" -o "$RECOVERY_ZIP"
+}
+
+unpack_image() {
+  if [ -f "$IMAGE_BIN" ]; then
+    echo "Using existing image $IMAGE_BIN"
+    return
+  fi
+  echo "Extracting chromeos_image.bin from recovery archive"
+  unzip -p "$RECOVERY_ZIP" "*.bin" > "$IMAGE_BIN"
+}
+
+ensure_image_ready() {
+  if [ ! -f "$IMAGE_BIN" ]; then
+    echo "Recovery image missing. Run '$0 init' first." >&2
+    exit 1
+  fi
+}
+
+inject_payload() {
+  ensure_image_ready
+  if [ -z "$PAYLOAD_DIR" ]; then
+    echo "No --payload-dir provided; nothing to inject."
+    return
+  fi
+  if [ ! -d "$PAYLOAD_DIR" ]; then
+    echo "Payload directory '$PAYLOAD_DIR' not found." >&2
+    exit 1
+  fi
+
+  echo "Injecting payload from $PAYLOAD_DIR into stateful partition of $IMAGE_BIN"
+  local loopdev mount_dir
+  mount_dir=$(mktemp -d)
+  loopdev=$(sudo losetup --find --show --partscan "$IMAGE_BIN")
+  trap 'sudo umount "$mount_dir" >/dev/null 2>&1 || true; sudo losetup -d "$loopdev" >/dev/null 2>&1 || true; rmdir "$mount_dir" 2>/dev/null || true' EXIT
+
+  if [ ! -b "${loopdev}p1" ]; then
+    echo "Could not locate stateful partition (${loopdev}p1)." >&2
+    exit 1
+  fi
+
+  sudo mount "${loopdev}p1" "$mount_dir"
+  sudo mkdir -p "$mount_dir/factory-shim"
+  sudo rsync -a "$PAYLOAD_DIR"/ "$mount_dir/factory-shim/"
+  sync
+  sudo umount "$mount_dir"
+  sudo losetup -d "$loopdev"
+  rmdir "$mount_dir"
+  trap - EXIT
+  echo "Payload injected. Files placed under /mnt/stateful_partition/factory-shim in recovery."
+}
+
+write_to_device() {
+  ensure_image_ready
+  if [ -z "$TARGET_DEVICE" ]; then
+    echo "--device /dev/sdX is required for write." >&2
+    exit 1
+  fi
+  if [ ! -b "$TARGET_DEVICE" ]; then
+    echo "Target device $TARGET_DEVICE is not a block device." >&2
+    exit 1
+  fi
+
+  echo "Writing recovery image to $TARGET_DEVICE (this will erase it)."
+  sudo dd if="$IMAGE_BIN" of="$TARGET_DEVICE" bs=4M status=progress conv=fsync
+  sync
+  echo "Done. Boot the ChromeOS device into recovery mode and insert the USB stick."
+}
+
+cmd_init() {
+  require_tools
+  ensure_data_root
+  echo "Preparing recovery image for board ${BOARD}"
+  fetch_image
+  unpack_image
+  echo "Init complete. Artifacts in $DATA_ROOT"
+}
+
+cmd_inject() {
+  require_tools
+  inject_payload
+}
+
+cmd_write() {
+  require_tools
+  inject_payload
+  write_to_device
+}
+
+cmd_clean() {
+  rm -f "$RECOVERY_ZIP" "$IMAGE_BIN"
+  echo "Removed artifacts in $DATA_ROOT"
+}
+
+# Argument parsing
+COMMAND=${1:-""}
+shift || true
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --board)
+      BOARD=$2
+      IMAGE_URL_DEFAULT="https://dl.google.com/dl/edgedl/chromeos/recovery/chromeos_${BOARD}_recovery_stable-channel_latest.bin.zip"
+      IMAGE_URL=$IMAGE_URL_DEFAULT
+      shift 2
+      ;;
+    --image-url)
+      IMAGE_URL=$2
+      shift 2
+      ;;
+    --data-root)
+      DATA_ROOT=$2
+      RECOVERY_ZIP="${DATA_ROOT}/recovery.zip"
+      IMAGE_BIN="${DATA_ROOT}/chromeos_image.bin"
+      shift 2
+      ;;
+    --payload-dir)
+      PAYLOAD_DIR=$2
+      shift 2
+      ;;
+    --device)
+      TARGET_DEVICE=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+case "$COMMAND" in
+  init)
+    cmd_init
+    ;;
+  inject)
+    cmd_inject
+    ;;
+  write)
+    cmd_write
+    ;;
+  clean)
+    cmd_clean
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
 
